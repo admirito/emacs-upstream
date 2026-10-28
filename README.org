@@ -1,0 +1,156 @@
+#+TITLE: emacs-upstream
+#+OPTIONS: toc:nil num:nil
+
+The current stable release of [[https://www.gnu.org/software/emacs/][GNU Emacs]] for Ubuntu 24.04 LTS and 26.04 LTS, as a
+plain .deb that lives beside Ubuntu's own emacs.
+
+Ubuntu ships the Emacs that was current when the release froze, and keeps it for the
+life of the release. This builds the newest one from GNU's signed release tarball,
+against the libraries of each Ubuntu release, with a short recipe you can read in a
+few minutes. It installs under =/opt/emacs-upstream= and is the Emacs you get when
+you type =emacs=, while Ubuntu's emacs, if installed, keeps working as before.
+
+What the build turns on:
+
+- Native compilation of all of Emacs's own Lisp, done at build time.
+- Tree-sitter, SQLite, GnuTLS, HarfBuzz text shaping, SVG and WebP images, and the
+  rest of what Ubuntu's own emacs builds with.
+
+Built for amd64.
+
+* Provenance
+
+Almost none of this is mine. It was written by Claude, in Claude Code, across a
+conversation in which I chose what to build and how, pushed back on the proposals,
+and reviewed the result. The design decisions are mine; the code is very largely
+not.
+
+* Flavors
+
+| Package                | Toolkit | Like Ubuntu's | For                            |
+|------------------------+---------+---------------+--------------------------------|
+| =emacs-upstream=       | GTK 3   | =emacs-gtk=   | most people                    |
+| =emacs-upstream-lucid= | Lucid   | =emacs-lucid= | running Emacs as a daemon on X |
+
+A daemon built with GTK crashes when an X display it has had a frame on goes away:
+when you log out of X while the daemon lives on in a tmux session, or an =ssh -X=
+connection that had a frame closes. Every =emacsclient= on that daemon goes with
+it. Lucid survives this, with plainer menus and scroll bars and no GTK theme. Both
+flavors are X11 programs; on a Wayland desktop they run through XWayland.
+
+The two replace each other, so install one.
+
+* Install
+
+Download the .deb for your Ubuntu release from the [[https://github.com/admirito/emacs-upstream/releases][releases page]] and install it
+with apt, which pulls in the libraries it needs:
+
+#+begin_src sh
+sudo apt install ./emacs-upstream_31.1-1.ubuntu26.04_amd64.deb
+#+end_src
+
+Log out and in again: that is when your shells and your desktop pick up the new
+=PATH= and menu entries.
+
+To check that a .deb was built by this repository's release workflow, and from
+which commit, use the [[https://cli.github.com/][GitHub CLI]]:
+
+#+begin_src sh
+gh attestation verify emacs-upstream_31.1-1.ubuntu26.04_amd64.deb -R admirito/emacs-upstream
+#+end_src
+
+=SHA256SUMS= in each release only tells a damaged download from a good one.
+
+To remove it, whichever flavor is installed:
+
+#+begin_src sh
+sudo apt purge emacs-upstream emacs-upstream-lucid
+#+end_src
+
+* Beside Ubuntu's emacs
+
+Ubuntu's add-on packages, the =elpa-*= ones, compile their Lisp by running
+=/usr/bin/emacs=, and Lisp compiled by a newer Emacs may not load in an older one.
+So while Ubuntu's emacs is installed, =/usr/bin/emacs= stays Ubuntu's, and this
+Emacs reaches you through =PATH= instead:
+
+| Who starts Emacs                                  | This one alone | Both installed |
+|---------------------------------------------------+----------------+----------------|
+| You: shells, =EDITOR=, the application menu       | this one       | this one       |
+| Ubuntu's add-on packages, compiling their Lisp    | none installed | Ubuntu's       |
+| =sudo=, cron, scripts starting =#!/usr/bin/emacs= | this one       | Ubuntu's       |
+
+Do not point =/usr/bin/emacs= at this Emacs with =update-alternatives= while
+Ubuntu's emacs is installed: its add-ons would then be compiled by the wrong Emacs.
+
+Ubuntu's =elpa-*= packages are for Ubuntu's emacs, and this one does not load them.
+Install packages with =M-x package-install= instead.
+
+* What you get
+
+- =/opt/emacs-upstream/=: the whole of Emacs.
+- =/etc/profile.d/emacs-upstream.sh= and
+  =/usr/lib/environment.d/990-emacs-upstream.conf=: put it first on =PATH=, and its
+  desktop entries in the menu, for login shells and for the desktop session.
+- =/usr/bin/emacs=, =emacsclient=, =etags= and =ebrowse=: links into
+  =/opt/emacs-upstream/bin= while Ubuntu's emacs is not installed.
+- =/usr/lib/systemd/user/emacs-upstream.service=: the daemon's unit.
+
+To start the daemon at login:
+
+#+begin_src sh
+systemctl --user enable --now emacs-upstream
+#+end_src
+
+* Updates
+
+There is no apt repository, so =apt upgrade= does not bring a new release. To hear of
+one, watch the repository's releases on GitHub, or follow
+[[https://github.com/admirito/emacs-upstream/releases.atom][its feed]].
+
+After upgrading Ubuntu to a new release, install the build for that release: the old
+one depends on the libraries of the old release.
+
+* Build it yourself
+
+The build runs in a container of the target Ubuntu release, so it works on any
+Ubuntu or Debian with =make=, =curl=, =gpg= and =podman= or =docker=:
+
+#+begin_src sh
+make                    # the GTK 3 flavor of the Makefile's release, for Ubuntu 26.04
+make test               # install it in a clean container and check it
+make install            # install it on this machine
+make UBUNTU=24.04       # for Ubuntu 24.04
+make TOOLKIT=lucid      # the Lucid flavor
+make VERSION=30.2       # another Emacs release
+#+end_src
+
+The tarball is checked against the Emacs release keys in [[file:keys/][keys/]], and the build
+stops if the signature does not match. The .deb's =Maintainer= comes from =git config
+user.name= and =user.email=; set =MAINTAINER="Name <email>"= to use something else.
+A build takes about 10 minutes on twelve cores, and the .deb is about 80 MB.
+
+* Releasing
+
+A tag =v<emacs>-<revision>= makes GitHub Actions build and test every flavor for
+every Ubuntu release, and publish them as a release with the signed tarball, its
+signature and their attestations. The tag must match =make print-version=.
+
+- *A new Emacs release:* set =VERSION= in the Makefile and =REVISION= back to 1, run
+  =make test= for each flavor and release, commit, tag, and push the tag.
+- *A change to the recipe for the same Emacs:* raise =REVISION=. Every tag builds
+  every release, so the revisions of all .debs stay in step.
+- *gpgv says "No public key":* the release was signed by a new key. Refresh
+  [[file:keys/][keys/]] from Savannah (see [[file:DESIGN.org][DESIGN.org]]), check the new fingerprint against the
+  release announcement, and name it in the commit.
+- *A new Ubuntu LTS:* add it to the workflow's matrix, make it the Makefile's
+  default, and name it in this file's first line; drop a release the same way when
+  its standard support ends.
+- *Now and then:* move the actions pinned in the workflow to their latest releases.
+
+A fork needs the repository variable =MAINTAINER= set to ="Name <email>"=, and
+release immutability turned on in the repository's settings.
+
+* License
+
+GPL-3.0-or-later, the same as Emacs. See [[file:LICENSE][LICENSE]].

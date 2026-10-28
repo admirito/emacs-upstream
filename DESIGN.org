@@ -1,0 +1,232 @@
+#+TITLE: Design notes
+#+OPTIONS: toc:2 num:nil
+
+Why the recipe is shaped the way it is, what was considered instead, and what would
+change each choice.
+
+* What else exists
+
+- *Ubuntu's own emacs* is the version that was current when the release froze, and
+  stays at it.
+- *The Emacs snap* is current and well kept, with GTK and pgtk tracks. It runs with
+  classic confinement, bundles its own libraries, refreshes itself, and needs snapd.
+- *The Flathub package* runs sandboxed, which gets in the way of an editor that
+  starts compilers, language servers and shells.
+- *Personal PPAs* build .debs, but each rests on one person's time, and they fall
+  behind: kelleyk's stopped at Emacs 28.1 in 2022.
+- *Building from source by hand* leaves files under =/usr/local= that no package
+  manager knows about.
+
+This project is a plain .deb on the system's own libraries, built by a recipe short
+enough to read, in public CI. The pattern of publishing CI builds as GitHub
+releases is the one [[https://github.com/jimeh/emacs-builds][jimeh/emacs-builds]] uses for macOS. Being one person's project
+too, it keeps the work per release to a short list (README.org, Releasing).
+
+* The source: the signed release tarball
+
+The release tarball, not a git checkout: it is what GNU signs, and it carries the
+generated files (=configure=, the info manuals), so the build needs no autotools.
+
+[[file:keys/emacs-release-keyring.asc][keys/emacs-release-keyring.asc]] is the Emacs project's release keyring, saved as
+Savannah serves it at
+=https://savannah.gnu.org/project/release-gpgkeys.php?group=emacs&download=1=.
+It is committed, not downloaded with the tarball: a keyring fetched from the same
+place as the tarball would add no trust, while a committed one makes every change of
+keys a reviewed diff. GNU's general keyring would also do, but it holds every GNU
+maintainer's key, and its copies of the Emacs keys can lag behind Savannah's.
+
+=gpgv --keyring= reads only that keyring, never the user's own trusted keys, and
+does not check expiry or revocation. So the file is the whole trust policy: an
+expired key keeps verifying the releases it signed, and the way to stop trusting a
+key is to remove it from the file. A release signed by a key the file lacks fails
+the build; that is the moment to refresh the file and check the new fingerprint
+against the release announcement.
+
+* The build: a container per Ubuntu release
+
+A .deb links against the shared libraries of the release it was built on, so each
+Ubuntu release gets a build of its own, in a container of that release. The
+container has the build dependencies of Ubuntu's own =emacs= package
+(=apt-get build-dep=), so the host needs only a container engine.
+
+The build script is mounted into the container, not copied into the image, so the
+image holds only Ubuntu and the build dependencies and changes only when the
+Containerfile does.
+
+** Compiler and flags
+
+Native compilation loads =libgccjit= at runtime, and configure finds it only with
+the gcc of the same version. On 26.04 Ubuntu's emacs builds with gcc 14 while the
+default gcc is 15. The script reads the version off the installed =libgccjit-*-dev=
+rather than naming it, so a new release needs no edit.
+
+=dpkg-buildflags= gives the flags Ubuntu builds its packages with: hardening and
+frame pointers. Link-time optimization is turned off, as Ubuntu turns it off for
+its own emacs and as Emacs's INSTALL advises: it "tends to cause crashes and to make
+Emacs slower". The programs and the =.eln= files are stripped, as Ubuntu's are.
+Where the release's dpkg supports it, as on 26.04, the programs also carry the ELF
+note that names their package in crash reports.
+
+** Configure
+
+The configure line asks for most features by name. Where a feature's library is
+missing, configure then fails instead of leaving the feature out without a word;
+=test.sh= checks the features configure only warns about. =--with-selinux= is named
+for another reason: Ubuntu's emacs has it, and Emacs 31 no longer turns it on by
+itself.
+
+Departures from Ubuntu's own build, each with its reason:
+
+- =--with-native-compilation=aot= compiles all of Emacs's Lisp, about 1,500 files,
+  during the build. Ubuntu compiles only the files Emacs loads at startup, and each
+  user's Emacs compiles the rest in the background the first time it is loaded.
+  Arch, Fedora, Nixpkgs and the snap all use =aot=.
+- =--disable-build-details= keeps the build's hostname and time out of the binary,
+  a step toward builds anyone can reproduce. The cost: =emacs-version= no longer
+  shows when Emacs was built.
+- The Lisp search path has =/usr/local/share/emacs= before this package's own
+  folders, as Ubuntu's has, but not Ubuntu's =/usr/share/emacs/site-lisp=, which
+  holds Lisp for Ubuntu's emacs.
+
+Considered and left out: =xwidgets= (a web engine to keep patched, and it crashes
+with current WebKitGTK), =imagemagick= (off upstream for security), =cairo-xcb= (it
+crashes when a frame opens on a display after another display closed, the daemon's
+pattern), uncompressed =.el= files (57 MB more), and =-O3= or =-march=native=
+(discouraged by INSTALL, and a binary for one CPU).
+
+* Two toolkits
+
+GTK 3 is the default, as in Ubuntu, Arch and the snap. Lucid is the second flavor
+because of the daemon: a GTK Emacs aborts when it loses its connection to an X
+display, and it keeps the connection open after its last frame there is closed.
+=etc/PROBLEMS= says to use Lucid if Emacs must survive closing displays, and a test
+with a daemon, a frame, and an X server killed after the frame was closed agrees:
+GTK aborts, Lucid lives on.
+
+Both flavors install into the same folder, so they conflict with and replace each
+other, the way Ubuntu's =emacs-gtk= and =emacs-lucid= do. Each is a full build of its
+own, since native-compiled Lisp is tied to its binary.
+
+pgtk, the native Wayland toolkit, is left out: it is not supported on X11, so it
+would be a third flavor, and its daemon dies with the Wayland compositor too. On a
+Wayland desktop the GTK and Lucid flavors run through XWayland.
+
+What would change this: a GTK Emacs that survives a lost display makes the Lucid
+flavor unnecessary; Wayland users asking for pgtk would make it a third flavor.
+
+* Beside Ubuntu's emacs
+
+** The constraint
+
+Ubuntu's emacs add-on packages, the =elpa-*= ones, compile their Lisp when installed
+by running =emacs= with =PATH= reset to =/usr/sbin:/usr/bin:/sbin:/bin=, and put the
+result where Ubuntu's emacs loads it. Lisp compiled by a newer Emacs may not load in
+an older one. So whatever =/usr/bin/emacs= is, it must be Ubuntu's emacs while that
+is installed.
+
+** Two lanes
+
+The package keeps out of that lane. Its =update-alternatives= links for =emacs=,
+=emacsclient=, =etags= and =ebrowse= use Ubuntu's own groups and man page links, at
+priority 20 against Ubuntu's 28: with Ubuntu's emacs installed the links stay
+Ubuntu's, and without it they lead here, so =sudo=, cron and =#!/usr/bin/emacs=
+scripts still find an Emacs.
+
+Users reach this Emacs through =PATH= instead, which two files put first: one in
+=/etc/profile.d= for login shells, one in =/usr/lib/environment.d= for the desktop
+session, the way snapd adds =/snap/bin=. The second is numbered 990 to come after
+systemd's =99-environment.conf=, which sets =PATH= outright from =/etc/environment=.
+
+The same two files add =/opt/emacs-upstream/share= to =XDG_DATA_DIRS=, where the
+desktop looks for application entries and icons. Emacs's own entries are used
+unchanged. Ubuntu's emacs has entries of the same names, and the first folder
+listed wins, so the menu follows the same lane as the shell.
+
+** Considered instead
+
+- *Taking over =/usr/bin/emacs=* at a priority above Ubuntu's: Ubuntu's add-ons
+  would be compiled by this Emacs, and could fail to install.
+- *Conflicting with Ubuntu's emacs:* correct and simplest, but it gives up having
+  both installed.
+- *Registering as an emacsen flavor of its own,* as Debian once ran several Emacs
+  versions side by side: Ubuntu's add-ons would be compiled for this Emacs too, and
+  usable in it. The cost is a dependency on =emacsen-common=, a startup hook into
+  Debian's =site-start.d=, and an install that fails whenever one of Ubuntu's
+  add-ons does not compile under the newer Emacs.
+- *A wrapper as =/usr/bin/emacs=* that hands dpkg's runs to Ubuntu's emacs: hidden
+  behavior that breaks when an admin runs the add-on scripts by hand.
+- *Links in =/usr/local/bin=:* that folder belongs to the admin.
+
+* The package
+
+** Under /opt
+
+Debian policy keeps packages out of =/usr/local=, and installing into =/usr= would
+collide with files of =emacs-common=, which every Ubuntu emacs installs: the icons,
+the desktop entries, the user unit, =subdirs.el=.
+=/opt/emacs-upstream= holds the whole of Emacs, as =/opt/google/chrome= holds
+Chrome.
+
+The daemon's systemd unit is the exception, because systemd looks for user units
+only in its own folders: it is =/usr/lib/systemd/user/emacs-upstream.service=, named
+so as not to clash with the =emacs.service= of =emacs-common=.
+
+** Not a replacement for Ubuntu's emacs
+
+The package does not =Provide= =emacs=. Packages that depend on =emacs= install
+their Lisp for Ubuntu's emacs, which this one does not load; claiming to provide it
+would let them install and then not work.
+
+** Dependencies
+
+=dpkg-shlibdeps= computes =Depends= from the shared libraries the installed programs
+link, as a Debian package build does. The =.eln= files link only libc, so the scan
+skips them. =Recommends= is Ubuntu's, an emoji font. Ubuntu's emacs also recommends
+=mailutils=, but =mailutils= recommends a mail server, so apt would install postfix
+with Emacs; here it is suggested, with gcc and git, which build the tree-sitter
+grammars Emacs offers to install when a mode needs one.
+
+** The version
+
+=31.1-1.ubuntu26.04=: the Emacs release, the package revision, and the Ubuntu
+release it was built for. The suffix tells two builds of the same release apart and
+makes the newer Ubuntu's build the newer version, so after an upgrade of Ubuntu the
+matching build installs over the old one. Every tag builds every Ubuntu release:
+=31.1-2.ubuntu24.04= sorts above =31.1-1.ubuntu26.04=, so a revision for one release
+alone would break that order.
+
+Debian usually joins such a suffix with a tilde, but GitHub turns a tilde in a
+release file's name into a dot, which would leave the file named differently from
+the version inside it.
+
+* Testing
+
+=make test= installs the .deb in a clean container of its release and checks, in
+order: that every dependency comes in; that the commands and their man pages lead
+here and come first on =PATH=, for login shells and for the desktop session, as do
+its desktop entries; that the daemon's unit starts this Emacs; that Emacs has every
+feature it was built for; that it can compile a function natively at runtime, which
+needs gcc's own files and not just =libgccjit=; that an upgrade keeps the links;
+that with Ubuntu's =emacs-nox= beside it, =/usr/bin/emacs= is Ubuntu's again while
+users still find this one first, and an add-on is compiled by Ubuntu's emacs; and
+that purging it leaves nothing behind.
+
+* CI and releases
+
+GitHub Actions runs the same =make test= as a local build, on the free standard
+runners, for each Ubuntu release and flavor. A release tag must match the version
+the Makefile names, so the tagged commit says what it built; a run started by hand
+builds and tests the same way and publishes nothing.
+
+A release carries the .debs, the GNU tarball with its signature, and their
+checksums. The tarball meets the GPL's requirement to offer the source with the
+binaries, and the tag's source archives, which GitHub attaches to every release,
+carry the scripts that built them. Each .deb also gets a build provenance
+attestation, signed by GitHub for this workflow at this commit and recorded in a
+public log: the checksums are uploaded by the same job as the .debs, so they only
+catch a damaged download. The repository has release immutability turned on, so a
+published release's files and tag cannot be changed later.
+
+The workflow uses only GitHub's own actions, each pinned to a commit, and runs with
+read access except in the job that publishes. The =Maintainer= of the released .debs
+comes from a repository variable.

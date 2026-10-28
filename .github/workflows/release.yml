@@ -1,0 +1,98 @@
+# Pushing a tag such as v31.1-1 builds the Emacs release and package revision the
+# Makefile names, which the tag must match, for each Ubuntu release and toolkit in
+# the matrix, tests the .debs and publishes them as a GitHub release, together with
+# the signed tarball they were built from and a provenance attestation for each
+# .deb. Started by hand, it builds and tests the same way and releases nothing.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        ubuntu: ['24.04', '26.04']
+        toolkit: [gtk3, lucid]
+    # The build runs in a container of its own Ubuntu release, so the runner's
+    # release does not matter.
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      ENGINE: docker
+      UBUNTU: ${{ matrix.ubuntu }}
+      TOOLKIT: ${{ matrix.toolkit }}
+      # Set as a repository variable, so the address stays out of this file.
+      MAINTAINER: ${{ vars.MAINTAINER }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check the tag names what the Makefile builds
+        if: github.event_name == 'push'
+        run: test "$GITHUB_REF_NAME" = "v$(make -s print-version)"
+      - run: make test
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-${{ matrix.ubuntu }}-${{ matrix.toolkit }}
+          path: |
+            out/*.deb
+            out/emacs-*.tar.xz
+            out/emacs-*.tar.xz.sig
+          compression-level: 0
+      - if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: log-${{ matrix.ubuntu }}-${{ matrix.toolkit }}
+          path: out/build-*.log
+
+  release:
+    # A run started by hand on a tag must not publish.
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      # Every build carries the same tarball, so merging them keeps one copy.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: build-*
+          merge-multiple: true
+      # Signed by GitHub for this workflow at this commit, and checked with
+      # gh attestation verify; the checksums only catch a damaged download.
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: '*.deb'
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha256sum *.deb emacs-*.tar.xz emacs-*.tar.xz.sig >SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --title "GNU Emacs ${GITHUB_REF_NAME#v}" --notes-file - \
+            *.deb emacs-*.tar.xz emacs-*.tar.xz.sig SHA256SUMS <<'EOF'
+          GNU Emacs built from the signed release tarball attached here, one .deb for
+          each Ubuntu release and flavor:
+
+          - `emacs-upstream`: GTK 3, like Ubuntu's `emacs-gtk`.
+          - `emacs-upstream-lucid`: Lucid, like Ubuntu's `emacs-lucid`. Its daemon
+            survives the X display going away, which a GTK daemon does not.
+
+          Install the one whose name ends in your Ubuntu release, for example:
+
+              sudo apt install ./emacs-upstream_*.ubuntu26.04_amd64.deb
+
+          Then log out and in again, which puts it first on PATH. The README says how
+          it lives beside Ubuntu's emacs:
+          ${{ github.server_url }}/${{ github.repository }}#readme
+
+          Check where a .deb came from:
+
+              gh attestation verify <file>.deb -R ${{ github.repository }}
+          EOF
